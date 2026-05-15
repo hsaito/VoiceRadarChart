@@ -1,0 +1,147 @@
+name: Build Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Validate Tag And Scope
+    runs-on: ubuntu-latest
+    outputs:
+      run_build: ${{ steps.tagcheck.outputs.run_build }}
+      release_tag: ${{ steps.tagcheck.outputs.release_tag }}
+      prerelease: ${{ steps.tagcheck.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag format and branch rules
+        id: tagcheck
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${GITHUB_REF_NAME}"
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+
+          RUN_BUILD=false
+          PRERELEASE=false
+
+          STABLE_REGEX='^v[0-9]+(\.[0-9]+)*$'
+          PRE_REGEX='^v[0-9]+(\.[0-9]+)*-(alpha|beta)$'
+
+          if [[ "${TAG}" =~ ${PRE_REGEX} ]]; then
+            RUN_BUILD=true
+            PRERELEASE=true
+            echo "Prerelease tag accepted from any branch: ${TAG}"
+          elif [[ "${TAG}" =~ ${STABLE_REGEX} ]]; then
+            git fetch --no-tags origin "${DEFAULT_BRANCH}" --depth=1
+
+            if git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${DEFAULT_BRANCH}"; then
+              RUN_BUILD=true
+              PRERELEASE=false
+              echo "Stable tag accepted on default branch ancestry: ${TAG}"
+            else
+              echo "Stable tag rejected: ${TAG} is not on default branch (${DEFAULT_BRANCH})."
+            fi
+          else
+            echo "Tag ${TAG} does not match allowed formats. Skipping build."
+          fi
+
+          echo "run_build=${RUN_BUILD}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Publish And Zip (${{ matrix.rid }})
+    needs: prepare
+    if: needs.prepare.outputs.run_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            runner: windows-latest
+          - rid: win-arm64
+            runner: windows-latest
+          - rid: linux-x64
+            runner: ubuntu-latest
+          - rid: linux-arm64
+            runner: ubuntu-latest
+          - rid: osx-x64
+            runner: macos-latest
+          - rid: osx-arm64
+            runner: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore VoiceRadarChart.sln
+
+      - name: Publish
+        run: >
+          dotnet publish VoiceRadarChart/VoiceRadarChart.csproj
+          -c Release
+          -r ${{ matrix.rid }}
+          --self-contained false
+          -p:PublishSingleFile=true
+          -o artifacts/${{ matrix.rid }}
+
+      - name: Zip output (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zipName = "VoiceRadarChart-${{ needs.prepare.outputs.release_tag }}-${{ matrix.rid }}.zip"
+          Compress-Archive -Path "artifacts/${{ matrix.rid }}/*" -DestinationPath $zipName -Force
+
+      - name: Zip output (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          zipName="VoiceRadarChart-${{ needs.prepare.outputs.release_tag }}-${{ matrix.rid }}.zip"
+          cd "artifacts/${{ matrix.rid }}"
+          zip -r "../../${zipName}" .
+
+      - name: Upload zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zip-${{ matrix.rid }}
+          path: VoiceRadarChart-${{ needs.prepare.outputs.release_tag }}-${{ matrix.rid }}.zip
+
+  release:
+    name: Create GitHub Release
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.run_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all zip artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: zip-*
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          files: release-assets/*.zip
